@@ -33,3 +33,14 @@ class ConflictError(DomainError):
 
     code = "conflict"
     status = 409
+
+
+class PolicyDenied(DomainError):
+    """临床或库存策略阻止了本次用药请求，并附具体原因。"""
+
+    code = "policy_denied"
+    status = 422
+
+    def __init__(self, message: str, reasons: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.reasons = reasons or []

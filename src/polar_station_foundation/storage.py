@@ -76,6 +76,10 @@ class Database:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(SCHEMA)
+        # 药品与用药保障模块表与基础表共存于同一数据库。
+        from .med_storage import ensure_med_schema
+
+        ensure_med_schema(self.connection)
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:

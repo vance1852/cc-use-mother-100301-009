@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .med_api import med_route
 from .service import DomainService
 from .storage import Database
 
@@ -48,9 +49,17 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        # 药品与用药保障模块路由；未命中再回落到 404。
+        med_result = med_route(service, method, path, body, actor_id)
+        if med_result is not None:
+            return med_result
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
-        return exc.status, {"error": exc.code, "message": str(exc)}
+        payload = {"error": exc.code, "message": str(exc)}
+        reasons = getattr(exc, "reasons", None)
+        if reasons:
+            payload["reasons"] = reasons
+        return exc.status, payload
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
 
