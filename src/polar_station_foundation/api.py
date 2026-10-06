@@ -9,22 +9,34 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .pharmacy import PharmacyService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
-    """把一个 HTTP 语义请求分派到领域服务。"""
+    """把一个 HTTP 语义请求分派到领域服务。
+
+    service 为 PharmacyService 时同时提供药品保障路由；为 DomainService 时
+    仅提供基础路由。
+    """
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    pharmacy = service if isinstance(service, PharmacyService) else None
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
+        if pharmacy is not None:
+            pharmacy_response = _route_pharmacy(pharmacy, method, parsed.path, body,
+                                                parsed.query, actor_id)
+            if pharmacy_response is not None:
+                status, payload, created = pharmacy_response
+                return status, payload
         if method == "POST" and parsed.path == "/organizations":
             receipt = service.register_organization(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
@@ -53,6 +65,67 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _route_pharmacy(pharmacy: PharmacyService, method: str, path: str, body: dict[str, Any],
+                    query_string: str, actor_id: str):
+    """返回 (status, payload, created)；未命中路由返回 None。"""
+
+    query = parse_qs(query_string)
+
+    def call(fn, created: bool = True):
+        result = fn(actor_id=actor_id, **body)
+        replayed = bool(result.get("replayed", False))
+        return (200 if replayed else (201 if created else 200)), result, created
+
+    posts = {
+        "/medications": lambda: call(pharmacy.register_medication),
+        "/medication-aliases": lambda: call(pharmacy.register_alias),
+        "/medication-substitutes": lambda: call(pharmacy.register_substitute),
+        "/site-storage": lambda: call(pharmacy.configure_site_storage),
+        "/medication-policies": lambda: call(pharmacy.configure_medication_policy),
+        "/prescriber-profiles": lambda: call(pharmacy.set_prescriber_profile),
+        "/patients": lambda: call(pharmacy.register_patient),
+        "/approvals": lambda: call(pharmacy.grant_approval),
+        "/batches": lambda: call(pharmacy.intake_batch),
+        "/prescriptions": lambda: call(pharmacy.record_prescription),
+        "/prescription-amendments": lambda: call(pharmacy.amend_prescription),
+        "/reservations": lambda: call(pharmacy.reserve_prescription),
+        "/reservation-releases": lambda: call(pharmacy.release_reservation),
+        "/dispensations": lambda: call(pharmacy.dispense_prescription),
+        "/returns": lambda: call(pharmacy.return_dispensed),
+        "/losses": lambda: call(pharmacy.record_loss),
+        "/destructions": lambda: call(pharmacy.destroy_batch),
+        "/transfers": lambda: call(pharmacy.transfer_batch),
+        "/transfer-receptions": lambda: call(pharmacy.receive_transfer),
+    }
+    if method == "POST" and path in posts:
+        return posts[path]()
+    if method == "GET":
+        if path == "/site-inventory":
+            site_id = query.get("site_id", [""])[0]
+            if not site_id:
+                raise ValidationError("site_id 不能为空")
+            return 200, pharmacy.site_inventory(site_id), False
+        if path == "/shortage-risks":
+            site_id = query.get("site_id", [""])[0]
+            if not site_id:
+                raise ValidationError("site_id 不能为空")
+            return 200, pharmacy.shortage_and_expiry_risks(site_id), False
+        if path == "/prescription-decision":
+            return 200, pharmacy.evaluate_prescription(query.get("prescription_id", [""])[0]), False
+        if path == "/prescription-amendments":
+            return 200, {"items": pharmacy.list_amendments(query.get("prescription_id", [""])[0])}, False
+        if path == "/batch-destinations":
+            batch_id = query.get("batch_id", [""])[0]
+            return 200, pharmacy.batch_destinations(actor_id=actor_id, batch_id=batch_id), False
+        if path == "/pharmacy-audit-events":
+            after = int(query.get("after_sequence", ["0"])[0])
+            return 200, pharmacy.redacted_audit_events(actor_id=actor_id, after_sequence=after), False
+        if path == "/ledger-verification":
+            site_id = query.get("site_id", [None])[0]
+            return 200, pharmacy.verify_ledger(site_id), False
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +172,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = PharmacyService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

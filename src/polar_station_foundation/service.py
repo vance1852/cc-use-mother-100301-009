@@ -12,11 +12,12 @@ from .clock import Clock, SystemClock
 from .domain import is_allowed_category
 from .errors import ConflictError, NotFoundError, PermissionDenied, ValidationError
 from .models import Actor, DomainRecord, Site, WriteReceipt
+from .requests import idempotent
 from .storage import Database
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
-ROLES = frozenset({"admin", "operator", "reviewer", "auditor"})
+ROLES = frozenset({"admin", "operator", "reviewer", "auditor", "physician", "logistician"})
 
 
 class DomainService:
@@ -56,20 +57,11 @@ class DomainService:
 
     def _idempotent(self, connection, *, request_id: str, action: str,
                     payload: dict[str, Any], create: Callable[[], tuple[str, str, dict[str, Any]]]) -> WriteReceipt:
-        request_id = self._identifier(request_id, "request_id")
-        payload_hash = digest(payload)
-        row = connection.execute("SELECT * FROM request_receipts WHERE request_id=?", (request_id,)).fetchone()
-        if row:
-            if row["action"] != action or row["payload_hash"] != payload_hash:
-                raise ConflictError("request_id 已被不同内容使用")
-            return WriteReceipt(request_id, row["resource_type"], row["resource_id"], True)
-        resource_type, resource_id, response = create()
-        connection.execute(
-            "INSERT INTO request_receipts(request_id,action,payload_hash,resource_type,resource_id,response_json,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (request_id, action, payload_hash, resource_type, resource_id, canonical_json(response), self._now()),
+        return idempotent(
+            connection, now=self._now(),
+            identifier_validator=lambda value: self._identifier(value, "request_id"),
+            request_id=request_id, action=action, payload=payload, create=create,
         )
-        return WriteReceipt(request_id, resource_type, resource_id, False)
 
     def register_organization(self, *, request_id: str, actor_id: str,
                               organization_id: str, name: str) -> WriteReceipt:
@@ -141,7 +133,7 @@ class DomainService:
                    "name": name, "timezone_name": timezone_name}
         with self.database.transaction(immediate=True) as connection:
             actor = self._actor(connection, actor_id)
-            self._require(actor, "admin", "operator")
+            self._require(actor, "admin", "operator", "logistician")
             if actor.organization_id != organization_id and actor.role != "admin":
                 raise PermissionDenied("不能为其他组织登记场所")
             site_id = self._identifier(site_id, "site_id")
